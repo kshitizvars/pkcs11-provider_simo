@@ -122,12 +122,18 @@ static void *p11prov_sig_dupctx(void *ctx)
     /* This is not really funny. OpenSSL by default assumes contexts with
      * operations in flight can be easily duplicated, with all the
      * cryptographic status and then both contexts can keep going
-     * independently. We'll try here, but on failure we just fail */
+     * independently. We'll try here, but on failure we just 'move' the
+     * session to the new context (because that's what OpenSSL seem to
+     * prefer to use after duplication) and hope for the best. */
+
+    newctx->session = sigctx->session;
+    sigctx->session = NULL;
 
     if (slotid != CK_UNAVAILABLE_INFORMATION && handle != CK_INVALID_HANDLE) {
-        CK_SESSION_HANDLE sess = p11prov_session_handle(sigctx->session);
+        CK_SESSION_HANDLE newsess = p11prov_session_handle(newctx->session);
+        CK_SESSION_HANDLE sess = CK_INVALID_HANDLE;
 
-        ret = p11prov_GetOperationState(sigctx->provctx, sess, NULL_PTR,
+        ret = p11prov_GetOperationState(sigctx->provctx, newsess, NULL_PTR,
                                         &state_len);
         if (ret != CKR_OK) {
             goto done;
@@ -137,33 +143,31 @@ static void *p11prov_sig_dupctx(void *ctx)
             goto done;
         }
 
-        ret = p11prov_GetOperationState(sigctx->provctx, sess, state,
+        ret = p11prov_GetOperationState(sigctx->provctx, newsess, state,
                                         &state_len);
         if (ret != CKR_OK) {
             goto done;
         }
 
-        ret = p11prov_get_session(newctx->provctx, &slotid, NULL, NULL,
-                                  newctx->mechtype, NULL, NULL, reqlogin, false,
-                                  &newctx->session);
+        ret = p11prov_get_session(sigctx->provctx, &slotid, NULL, NULL,
+                                  sigctx->mechtype, NULL, NULL, reqlogin, false,
+                                  &sigctx->session);
         if (ret != CKR_OK) {
             P11PROV_raise(sigctx->provctx, ret,
                           "Failed to open session on slot %lu", slotid);
             goto done;
         }
-        sess = p11prov_session_handle(newctx->session);
+        sess = p11prov_session_handle(sigctx->session);
 
-        ret = p11prov_SetOperationState(newctx->provctx, sess, state, state_len,
+        ret = p11prov_SetOperationState(sigctx->provctx, sess, state, state_len,
                                         handle, handle);
-    } else {
-        ret = CKR_KEY_HANDLE_INVALID;
+        if (ret != CKR_OK) {
+            p11prov_return_session(sigctx->session);
+            sigctx->session = NULL;
+        }
     }
 
 done:
-    if (ret != CKR_OK) {
-        p11prov_sig_freectx(newctx);
-        newctx = NULL;
-    }
     OPENSSL_free(state);
     return newctx;
 }
